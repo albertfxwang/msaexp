@@ -1050,7 +1050,7 @@ def drizzle_2d_pipeline(slits, output_root=None, standard_waves=True, drizzle_pa
     return hdul
 
 
-def drizzled_hdu_figure(hdul, tick_steps=None, xlim=None, subplot_args=dict(figsize=(10, 4), height_ratios=[1,3], width_ratios=[10,1]), cmap='plasma_r', ymax=None, z=None, ny=None, output_root=None):
+def drizzled_hdu_figure(hdul, tick_steps=None, xlim=None, subplot_args=dict(figsize=(10, 4), height_ratios=[1,3], width_ratios=[10,1]), cmap='plasma_r', ymax=None, z=None, ny=None, output_root=None, savedpi=80):
     """
     Figure showing drizzled hdu
     """
@@ -1160,7 +1160,8 @@ def drizzled_hdu_figure(hdul, tick_steps=None, xlim=None, subplot_args=dict(figs
         ax.xaxis.set_ticks_position('both')
 
     axes[1].set_xticklabels(xt)
-    axes[1].grid()
+    # axes[1].grid()
+    axes[1].grid(color='gray', dashes=[8, 8], linewidth=0.5, zorder=-1)
     
     if z is not None:
         cc = grizli.utils.MPL_COLORS
@@ -1214,7 +1215,8 @@ def drizzled_hdu_figure(hdul, tick_steps=None, xlim=None, subplot_args=dict(figs
         
     else:
         axes[0].set_xticklabels([])
-        axes[0].grid()
+        # axes[0].grid()
+        axes[0].grid(color='gray', dashes=[8, 8], linewidth=0.5, zorder=-1)
     
     if output_root is not None:
         axes[1].text(0.97,0.96, output_root,
@@ -1222,7 +1224,10 @@ def drizzled_hdu_figure(hdul, tick_steps=None, xlim=None, subplot_args=dict(figs
                       transform=axes[1].transAxes,
                       fontsize=8, 
                       bbox={'fc':'w', 'alpha':0.5, 'ec':'None'})
-        
+        # <<221111>> added by XW
+        if savedpi is not None:
+            fig.savefig(f'{output_root}.driz.png', bbox_inches='tight', dpi=savedpi)
+
     if xlim is not None:
         xvi = np.interp(xlim, sp['wave'], np.arange(len(sp)))
         for ax in axes:
@@ -1336,16 +1341,16 @@ def extract_all():
         hdul.flush()
         
 
-# taken from https://jwst-docs.stsci.edu/jwst-near-infrared-spectrograph/nirspec-instrumentation/nirspec-dispersers-and-filters
-nirspec_limits = {
-    'G140H': [0.97, 1.82, 0.5],
-    'G235H': [1.66, 3.05, 0.5],
-    'G395H': [2.87, 5.14, 0.5],
-    'G140M': [0.97, 1.84, 0.5],
-    'G235M': [1.66, 3.07, 0.5],
-    'G395M': [2.87, 5.10, 0.5],
-    'PRISM': [0.60, 5.30, 0.5],
-}
+# # taken from https://jwst-docs.stsci.edu/jwst-near-infrared-spectrograph/nirspec-instrumentation/nirspec-dispersers-and-filters
+# nirspec_limits = {
+#     'G140H': [0.97, 1.82, 0.5],
+#     'G235H': [1.66, 3.05, 0.5],
+#     'G395H': [2.87, 5.14, 0.5],
+#     'G140M': [0.97, 1.84, 0.5],
+#     'G235M': [1.66, 3.07, 0.5],
+#     'G395M': [2.87, 5.10, 0.5],
+#     'PRISM': [0.60, 5.30, 0.5],
+# }
 
 def plot_nirspec_driz(file, ltick_sep=None, wavelim=None, fluxlim=None, cmap=cm.cubehelix_r, dpi=100):
     """
