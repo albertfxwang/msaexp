@@ -1226,10 +1226,6 @@ def drizzled_hdu_figure(hdul, tick_steps=None, xlim=None, subplot_args=dict(figs
                       transform=axes[1].transAxes,
                       fontsize=8, 
                       bbox={'fc':'w', 'alpha':0.5, 'ec':'None'})
-        # <<221111>> added by XW
-        if savedpi is not None:
-            fig.tight_layout(pad=0.5)
-            fig.savefig(f'{output_root}.driz.png', bbox_inches='tight', dpi=savedpi)
         
     if xlim is not None:
         xvi = np.interp(xlim, sp['wave'], np.arange(len(sp)))
@@ -1242,6 +1238,10 @@ def drizzled_hdu_figure(hdul, tick_steps=None, xlim=None, subplot_args=dict(figs
             
     fig.tight_layout(pad=0.5)
     
+    # <<221111>> added by XW
+    if output_root is not None and savedpi is not None:
+        fig.savefig(f'{output_root}.driz.png', bbox_inches='tight', dpi=savedpi)
+
     return fig
 
 def extract_all():
