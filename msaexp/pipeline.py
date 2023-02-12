@@ -6,6 +6,8 @@ import os
 import glob
 import time
 import traceback
+from collections import OrderedDict
+
 from tqdm import tqdm
 
 import numpy as np
@@ -29,9 +31,40 @@ FILTERS = ['clear', 'f070lp','f100lp','f170lp','f290lp']
 ACQ_FILTERS = ['f140x','f110w']
 DETECTORS = ['nrs1','nrs2']
 
+
+__all__ = ["query_program", "exposure_groups", "NirspecPipeline"]
+
+
 def query_program(prog=2767, download=True, detectors=DETECTORS, gratings=GRATINGS, filters=FILTERS, extensions=['s2d']):
     """
-    Query and download MSA exposures for a given program
+    Query and download MSA exposures for a given program from MAST
+    
+    Parameters
+    ----------
+    prog : int
+        Program ID
+    
+    download : bool
+        Download results
+    
+    detectors: list
+        List of detectors to consider ('nrs1','nrs2')
+    
+    gratings : list
+        List of gratings to consider ('prism','g140m','g140h','f235m','g235h','g395m','g395h')
+    
+    filters : list
+        List of filters to consider ('clear', 'f070lp','f100lp','f170lp','f290lp')
+    
+    extensions : list
+        File extensions to query.  ``s2d`` should have a one-to-one mapping with the level-1
+        countrate ``rate`` images, which are what we're after
+    
+    Returns
+    -------
+    res : `~astropy.table.Table`
+        Query result
+    
     """
     import mastquery.jwst
     import mastquery.utils
@@ -113,13 +146,33 @@ def download_msa_meta_files():
         mastquery.utils.download_from_mast(msa)
 
 
-def exposure_groups(path='./', verbose=True):
+def exposure_groups(path='./', files=None, verbose=True):
     """
-    Group by MSAMETFL, grating, filter, detector
+    Group files by MSAMETFL, grating, filter, detector
+    
+    Parameters
+    ----------
+    path : str
+        Path to ``rate.fits`` files
+    
+    files : list, None
+        Explicit list of ``rate.fits`` files to consider.  Otherwise, `glob` in working 
+        directory
+    
+    verbose : bool
+        Status messages
+    
+    Returns
+    -------
+    groups : dict
+        Dictionary of exposure groups
+    
     """
 
-    files = glob.glob('*rate.fits')
-    files.sort()
+    if files is None:
+        files = glob.glob('*rate.fits')
+        files.sort()
+        
     keys = ['filter','grating','effexptm','detector', 'msametfl']
     rows = []
     for file in files:
@@ -135,7 +188,7 @@ def exposure_groups(path='./', verbose=True):
 
     un = utils.Unique(tab['key'], verbose=verbose)
 
-    groups = {}
+    groups = OrderedDict()
     for v in un.values:
         groups[v] = [f for f in tab['file'][un[v]]]
     
@@ -148,7 +201,35 @@ class SlitData():
     """
     def __init__(self, file='jw02756001001_03101_00001_nrs1_rate.fits', step='phot', verbose=True, read=False, indices=None, targets=None):
         """
-        Load saved slits
+        Load slitlet objects from stored data files
+        
+        Parameters
+        ----------
+        file : str
+            Parent exposure file
+        
+        step : str
+            Calibration pipeline processing step of the output slitlet file
+        
+        verbose : bool
+            Print status messages
+        
+        read : bool
+            Don't just find the filenames but also read the data
+        
+        indices : list, None
+            Optional slit indices of specific files
+        
+        targets : list, None
+            Optional target names of specific individual sources
+        
+        Attributes
+        ----------
+        slits : list
+            List of `jwst.datamodels.SlitModel` objects
+        
+        files : list
+            Filenames of slitlet data
         """
 
         self.slits = []
@@ -174,12 +255,15 @@ class SlitData():
 
     @property
     def N(self):
+        """
+        Number of slitlets
+        """
         return len(self.files)
 
 
     def read_data(self, verbose=True):
         """
-        Read files into SlitModel objects
+        Read files into SlitModel objects in `slits` attribute
         """
         from jwst.datamodels import SlitModel
 
@@ -191,9 +275,56 @@ class SlitData():
 
 
 class NirspecPipeline():
-    def __init__(self, mode='jw02767005001-02-clear-prism-nrs1', files=None, verbose=True):
+    def __init__(self, mode='jw02767005001-02-clear-prism-nrs1', files=None, verbose=True, source_ids=None, pad=0):
         """
+        Container class for NIRSpec data, generally in groups split by grating/filter/detector
+        
+        Parameters
+        ----------
+        mode : str
+            Group / mode name, i.e., in the groups computed in 
+            `msaexp.pipeline.exposure_groups`
+        
+        files : list
+            Explicit list of exposure or slitlet files
+        
+        verbose : bool
+            Print status messages
+        
+        source_ids : list
+            Specific list of source ids to trim from the MSA metadata file
+        
+        pad : int
+            Number of dummy slits to pad the open slitlets
+        
+        Attributes
+        ----------
+        mode : str
+            Group name
+        
+        files : list
+            List of exposure (``rate.fits``) filenames
+        
+        pipe : dict
+            Dictionary with data from the various calibration pipeline products.  The final
+            flux-calibrated data should generally be in ``pipe['phot']``
+        
+        last_step : str
+            The last step of the calibration pipeline that was run, e.g., 'phot'
+        
+        slitlets : dict
+            Slitlet metadata
+        
+        msametfl : str
+            Filename of the MSAMETFL metadata file
+        
+        msa : `msaexp.msa.MSAMetafile`
+            MSA metadata object, perhaps that has been modified by the parameters
+            ``source_ids`` and ``pad`` above
+        
         """
+        from .msa import pad_msa_metafile, MSAMetafile
+        
         self.mode = mode
         utils.LOGFILE = self.mode + '.log.txt'
         
@@ -215,34 +346,63 @@ class NirspecPipeline():
             utils.log_comment(utils.LOGFILE, msg, verbose=True, 
                               show_date=False)
                               
-        self.pipe = {}
-        self.slitlets = {}
+        self.pipe = OrderedDict()
+        self.slitlets = OrderedDict()
         
         self.last_step = None
+        
+        self.msametfl = None
+        self.msa = None
+        
+        if len(self.files) > 0:
+            if os.path.exists(self.files[0]):
+                with pyfits.open(self.files[0]) as im:
+                    msametfl = im[0].header['MSAMETFL']
+                
+                if (pad > 0) | (source_ids is not None):
+                    msametfl = pad_msa_metafile(msametfl,
+                                                pad=pad,
+                                                source_ids=source_ids)
+            
+                self.msametfl = msametfl
+                print(f'msaexp.NirspecPipeline: mode={mode} msametfl={msametfl}')
+                
+                self.msa = MSAMetafile(self.msametfl)
+                with open(self.msametfl.replace('.fits','.reg'),'w') as fp:
+                    fp.write(self.msa.regions_from_metafile(as_string=True, with_bars=True))
 
 
     @property
     def grating(self):
+        """
+        Grating name, e.g., 'prism'
+        """
         return '-'.join(self.mode.split('-')[-3:-1])
 
 
     @property
     def detector(self):
+        """
+        Detector name, e.g., 'nrs1'
+        """
         return self.mode.split('-')[-1]
 
 
     @property
     def N(self):
+        """
+        Number of *exposures* for this group
+        """
         return len(self.files)
 
 
     @property
     def targets(self):
         """
-        Reformatted target name:
+        Reformatted target names for background and negative source names
         
-        background_{i} > b{i}
-        xxx_-{i} > xxx_m{i}
+        - ``background_{i}`` to ``b{i}``
+        - ``xxx_-{i}`` to ``xxx_m{i}``
         
         """
         return list(self.slitlets.keys())
@@ -258,13 +418,30 @@ class NirspecPipeline():
             return self.targets.index(key)
 
 
-    def preprocess(self, set_context=True):
+    def preprocess(self, set_context=True, fix_rows=True, scale_rnoise=True, **kwargs):
         """
         Run grizli exposure-level preprocessing
         
-        1. snowball masking
-        2. 1/f correction
-        3. median "bias" removal
+        1. Snowball masking
+        2. Apply 1/f correction
+        3. Median "bias" removal
+        4. Rescale RNOISE
+        
+        Parameters
+        ----------
+        set_context : bool
+            Set the `CRDS_CTX` based on the keyword in the exposure files
+        
+        fix_rows : bool
+            Apply 1/f correction to detector rows, as well as columns
+        
+        scale_rnoise : bool
+            Calculate rescaling of the ``VAR_RNOISE`` data extension based on pixel statistics
+        
+        Returns
+        -------
+        status : bool
+            True if completed OK
         
         """
         
@@ -290,11 +467,22 @@ class NirspecPipeline():
             jwst_utils.exposure_oneoverf_correction(file, erode_mask=False, 
                                     in_place=True, axis=0,
                                     deg_pix=256)
-        
+            
+            if fix_rows:
+                jwst_utils.exposure_oneoverf_correction(file, erode_mask=False, 
+                                        in_place=True, axis=1,
+                                        deg_pix=2048)
+                                        
         # bias
         for file in self.files:
             with pyfits.open(file, mode='update') as im:
                 dq = (im['DQ'].data & 1025) == 0
+                
+                if im[0].header['DETECTOR'] == 'NRS2':
+                    dq[:,:1400] = False
+                else:
+                    dq[:,1400:] = False
+
                 bias_level = np.nanmedian(im['SCI'].data[dq])
                 msg = f'msaexp.preprocess : bias level {file} ='
                 msg += f' {bias_level:.4f}'
@@ -302,22 +490,56 @@ class NirspecPipeline():
                                   show_date=True)
             
                 im['SCI'].data -= bias_level
-                im.flush()
+                im[0].header['MASKBIAS'] = bias_level, 'Bias level'
             
+                if scale_rnoise:
+                    resid = im['SCI'].data / np.sqrt(im['VAR_RNOISE'].data)
+                    rms = utils.nmad(resid[dq])
+        
+                    msg = f'msaexp.preprocess : rms of empty pixels {file} ='
+                    msg += f' {rms:.2f}'
+                    utils.log_comment(utils.LOGFILE, msg, verbose=True, 
+                                      show_date=True)
+
+                    im['SCI'].data -= bias_level
+                    im[0].header['SCLRNOISE'] = rms, 'RNOISE Scale factor'
+        
+                    im['VAR_RNOISE'].data *= rms**2
+                
+                im.flush()
+                
         return True
     
     
-    def run_jwst_pipeline(self, verbose=True):
+    def run_jwst_pipeline(self, verbose=True, run_flag_open=True, run_bar_shadow=True, **kwargs):
         """
         Steps taken from https://github.com/spacetelescope/jwebbinar_prep/blob/main/spec_mode/spec_mode_stage_2.ipynb
 
         See also https://jwst-pipeline.readthedocs.io/en/latest/jwst/pipeline/calwebb_spec2.html#calwebb-spec2
 
-        AssignWcs - initialize WCS and populate slit bounding_box data
-        Extract2dStep - identify slits and set slit WCS
-        FlatFieldStep - slit-level flat field
-        PathLossStep - NIRSpec path loss
-        PhotomStep - Photometric calibration
+        - `AssignWcs`:  initialize WCS and populate slit bounding_box data
+        - `Extract2dStep`:  identify slits and set slit WCS
+        - `FlatFieldStep`:  slit-level flat field
+        - `PathLossStep`:  NIRSpec path loss
+        - `BarShadowStep`:  Bar shadow correction
+        - `PhotomStep`:  Photometric calibration
+        
+        Parameters
+        ----------
+        verbose : bool
+            Printing status messages
+        
+        run_flag_open : bool
+            Run `jwst.msaflagopen.MSAFlagOpenStep` after `AssignWcsStep`
+        
+        run_bar_shadow : bool
+            Run `jwst.barshadow.BarShadowStep` after `PathLossStep`
+        
+        Returns
+        -------
+        status : bool
+            True if completed successfully
+        
         """
         # AssignWcs
         import jwst.datamodels
@@ -332,15 +554,25 @@ class NirspecPipeline():
 
         if 'wcs' not in self.pipe:
             wstep = AssignWcsStep()
-            self.pipe['wcs'] = [wstep.call(jwst.datamodels.ImageModel(f))
-                                for f in self.files]
+            
+            wcs = []
+            for file in self.files:
+                with pyfits.open(file) as hdu:
+                    hdu[0].header['MSAMETFL'] = self.msametfl
+                    wcs.append(wstep.call(jwst.datamodels.ImageModel(hdu)))
+            
+            self.pipe['wcs'] = wcs
+            
+            # self.pipe['wcs'] = [wstep.call(jwst.datamodels.ImageModel(f))
+            #                     for f in self.files]
+
         self.last_step = 'wcs'
 
         # step = ImprintStep()
         # pipe['imp'] = [step.call(obj) for obj in pipe[last]]
         # last = 'imp'
 
-        if 'open' not in self.pipe:
+        if ('open' not in self.pipe) & run_flag_open:
             step = MSAFlagOpenStep()
             self.pipe['open'] = []
             
@@ -351,7 +583,7 @@ class NirspecPipeline():
                 
                 self.pipe['open'].append(step.call(obj))
                 
-        self.last_step = 'open'
+            self.last_step = 'open'
 
         if '2d' not in self.pipe:
             step2d = Extract2dStep()
@@ -392,7 +624,18 @@ class NirspecPipeline():
         
         self.last_step = 'path'
 
-        # Skip BarShadow
+        if run_bar_shadow:
+            bar_step = BarShadowStep()
+            self.pipe['bar'] = []
+            
+            for i, obj in enumerate(self.pipe[self.last_step]):
+                msg = f'msaexp.jwst.BarShadowStep: {self.files[i]}'
+                utils.log_comment(utils.LOGFILE, msg, verbose=verbose, 
+                                  show_date=True)
+                
+                self.pipe['bar'].append(bar_step.call(obj))
+            
+            self.last_step = 'bar'
         
         if 'phot' not in self.pipe:
             phot_step = PhotomStep()
@@ -428,19 +671,44 @@ class NirspecPipeline():
                 utils.log_comment(utils.LOGFILE, msg, verbose=verbose, 
                                   show_date=False)
 
-                dm = SlitModel(self.pipe[step][j].slits[i].instance)
-                dm.write(slit_file, overwrite=True)
-        
+                try:
+                    dm = SlitModel(self.pipe[step][j].slits[i].instance)
+                    dm.write(slit_file, overwrite=True)
+                except:
+                    utils.log_comment(utils.LOGFILE, 'Failed',
+                                      verbose=verbose)
+                
         return True
 
 
     def initialize_slit_metadata(self, use_yaml=True, yoffset=0, prof_sigma=1.8/2.35, skip=[]):
         """
+        Initialize the `slitlets` metadata dictionary
+        
+        Parameters
+        ----------
+        use_yaml : bool
+            Read data from stored yaml file
+        
+        yoffset : float
+            Default cross-dispersion offset for source centering
+        
+        prof_sigma : float
+            Default profile width
+        
+        skip : list
+            Exposures to skip
+        
+        Returns
+        -------
+        slitlets : dict
+            Slitlet metadata
+        
         """
         import yaml
         from . import utils as msautils
         
-        slitlets = {}
+        slitlets = OrderedDict()
         
         if self.last_step not in ['2d','flat','path','phot']:
             return slitlets
@@ -511,47 +779,12 @@ class NirspecPipeline():
         return slitlets
 
 
-    def slit_bounding_box_regions(self): 
-        """
-        Make region files of slit bounding boxes in detector coordinates
-        """
-        
-        slitlets = self.slitlets
-        reg_files = []
-        pipe = self.pipe[self.last_step]
-        
-        for j, file in enumerate(self.files):
-            det_reg = file.replace('.fits','.detector.reg')
-
-            with open(det_reg,'w') as fp:
-                fp.write('image\n')
-                for key in slitlets:
-                    slitlet = slitlets[key]
-                    i = self.slit_index(key) #slitlet['slit_index']
-                    _slit = pipe[j].slits[i]
-                    _d = _slit.instance
-                    
-                    _x = [_d['xstart'], _d['xstart']+_d['xsize'], 
-                          _d['xstart']+_d['xsize'], _d['xstart']]
-                    _y = [_d['ystart'], _d['ystart'], 
-                          _d['ystart']+_d['ysize'], _d['ystart']+_d['ysize']]
-                          
-                    sr = utils.SRegion(np.array([_x, _y]), wrap=False)
-                    #print(sr.xy[0])
-                    if key.startswith('background'):
-                        sr.ds9_properties = 'color=white'
-
-                    sr.label = key
-                    fp.write(sr.region[0]+'\n')
-            
-            reg_files.append(det_reg)
-            
-        return reg_files
-
-
     def slit_source_regions(self, color='magenta'):
         """
         Make region file of source positions
+        
+        **Deprecated**, see `~msaexp.msa.MSAMetafile.regions_from_metafile`.
+        
         """
         regfile = f'{self.mode}.reg'
         with open(regfile, 'w') as fp:
@@ -570,6 +803,7 @@ class NirspecPipeline():
 
     def set_background_slits(self):
         """
+        Initialize elements in ``self.pipe['bkg']`` for background-subtracted slitlets
         """
         from tqdm import tqdm
         from jwst.datamodels import SlitModel
@@ -577,15 +811,6 @@ class NirspecPipeline():
         self.pipe['bkg'] = self.load_slit_data(step=self.last_step,
                                                targets=self.targets)
         
-        # self.pipe['bkg'] = []
-        #
-        # for j in tqdm(range(self.N)):
-        #     self.pipe['bkg'][j].slits = []
-        #     for i in range(len(self.pipe['phot'][j].slits)):
-        #         s = self.pipe['phot'][j].slits[i].copy()
-        #         s.has_background = False
-        #         self.pipe['bkg'][j].slits.append(s)
-                                                   
         for j in range(self.N):
             for s in self.pipe['bkg'][j].slits:
                 s.has_background = False
@@ -606,8 +831,6 @@ class NirspecPipeline():
         if key.startswith('background'):
             bounds[0] = (-8,8)
             
-        # print('xxx', bounds)
-        
         _slit_data = self.extract_spectrum(key, 
                                           fit_profile_params={},
                                       flux_unit=FLAM_UNIT,
@@ -623,30 +846,7 @@ class NirspecPipeline():
         yp, xp = np.indices(sh)
         x = xp[0,:]
         _dq = ~bad
-        # _ra = slitlet['source_ra']
-        # _dec = slitlet['source_dec']
-        #
-        # rs, ds, ws = _wcs.forward_transform(x,
-        #                              x*0+np.nanmean(yp[_dq]))
-        # if _ra <= 0:
-        #     x0 = np.nanmean(xp[_dq])
-        #     y0 = np.nanmean(yp[_dq])
-        #     _ra, _dec, ws = _wcs.forward_transform(x0, y0)
-        #
-        # xtr, ytr = _wcs.backward_transform(_ra, _dec, ws)
-        # yeval = np.nanmean(ytr)
-        # dytest = [0]
-        # for _dy in range(sh[0]):
-        #     dytest.extend([-_dy, _dy])
-        #
-        # for dy in dytest:
-        #     rs, ds, ws = _wcs.forward_transform(x,
-        #                                         x*0+yeval+dy)
-        #     if (~np.isfinite(ws)).sum() == 0:
-        #         break
-        #
-        # xtr, ytr = _wcs.backward_transform(_ra, _dec, ws)
-        # ytr -= 0.5
+        
         _res = msautils.slit_trace_center(_slit, 
                                   with_source_ypos=True, 
                                   index_offset=0.5)
@@ -771,6 +971,7 @@ class NirspecPipeline():
 
     def drizzle_2d(self, key, drizzle_params={}, **kwargs):
         """
+        not used...
         """
         from jwst.datamodels import SlitModel, ModelContainer
         from jwst.resample.resample_spec import ResampleSpecData
@@ -829,9 +1030,6 @@ class NirspecPipeline():
             
             msg = 'msaexp.get_slit_traces: '
             
-            #if j == self.N-1:
-            #    msg += f'! no index position found for {key}'
-            #else:
             msg += f'Trace set at index {jref} for {key}'
 
             utils.log_comment(utils.LOGFILE, msg, verbose=verbose, 
@@ -840,7 +1038,7 @@ class NirspecPipeline():
 
     def extract_spectrum(self, key, slit_key=None, prof_sigma=None, fit_profile_params={'min_delta':100}, pstep=1.0, show_sn=True, flux_unit=FNU_UNIT, vmax=0.2, yoffset=None, skip=None, bad_dq_bits=(1 | 1024), clip_sigma=-4, ntrim=5, get_slit_data=False, verbose=False, center2d=False, trace_sign=1, min_dyoffset=0.2, **kwargs):
         """
-        Extract 2D spectrum
+        Main function for extracting 2D/1D spectra from individual slitlets
         """                
         from gwcs import wcstools
         from photutils.psf import IntegratedGaussianPRF
@@ -946,8 +1144,8 @@ class NirspecPipeline():
             _sci[~_dq] = 0
             _ivar[~_dq] = 0
 
-            _bkg = _sci*0.
-            _bkgn = _sci*0.
+            _bkg = np.zeros(_sci.shape)
+            _bkgn = np.zeros(_sci.shape, dtype=int)
 
             _wcs = _slit.meta.wcs
             d2w = _wcs.get_transform('detector', 'world')
@@ -980,159 +1178,14 @@ class NirspecPipeline():
                     continue
                     
                 _dq = (_sbg.dq & bad_dq_bits) == 0
-                try:
-                    _bkg += _sbg.data*_dq
-                    _bkgn += _dq
+                try:                    
+                    _bkg[_dq] += _sbg.data[_dq]
+                    _bkgn[_dq] += 1
+                    
                 except ValueError:
                     #print('background failed', j)
                     continue
-
-            # _sci = None
-            # if ip % (self.N-1) == 0:
-            #     if (ip//(self.N-1)) in skip:
-            #         continue
-            #
-            #     axi = axes[ip//(self.N-1)]
-            #     for j in p:
-            #         if _sci is None:
-                    #     _slit = pipe[j].slits[i]
-                    #
-                    #     if 'bkg' in self.pipe:
-                    #         _bkg_slit = self.pipe['bkg'][j].slits[i]
-                    #     else:
-                    #         _bkg_slit = None
-                    #
-                    #     sh = _slit.data.shape
-                    #
-                    #     _dq = (pipe[j].slits[i].dq & bad_dq_bits) == 0
-                    #     _sci = pipe[j].slits[i].data
-                    #     _ivar = 1/pipe[j].slits[i].err**2
-                    #     _dq &= _sci*np.sqrt(_ivar) > clip_sigma
-                    #     _sci[~_dq] = 0
-                    #     _ivar[~_dq] = 0
-                    #
-                    #     _bkg = _sci*0.
-                    #     _bkgn = _sci*0.
-                    #
-                    #     _wcs = _slit.meta.wcs
-                    #     d2w = _wcs.get_transform('detector', 'world')
-                    #
-                    #     yp, xp = np.indices(sh)
-                    #
-                    #     _res = msautils.slit_trace_center(_slit,
-                    #                               with_source_ypos=True,
-                    #                               index_offset=0.5)
-                    #
-                    #     xd, yd, _w, _, _ = _res
-                    #
-                    #     xtr = xd
-                    #     if trace_sign > 0:
-                    #         ytr = slitlet['ytrace']*2 - yd + yoffset
-                    #     else:
-                    #         ytr = yd + yoffset
-                    #
-                    #     # # Trace along expected source position
-                    #     # s2d = _wcs.get_transform('slit_frame', 'detector')
-                    #     # d2s = _wcs.get_transform('detector', 'slit_frame')
-                    #     # s2w = _wcs.get_transform('slit_frame', 'world')
-                    #     # d2w = _wcs.get_transform('detector', 'world')
-                    #     #
-                    #     # bbox = _wcs.bounding_box
-                    #     # grid = wcstools.grid_from_bounding_box(bbox)
-                    #     # _, sy, slam = np.array(d2s(*grid))
-                    #     #
-                    #     # smi = np.nanmin(sy)
-                    #     # sma = np.nanmax(sy)
-                    #     #
-                    #     # x = np.arange(sh[1], dtype=float)
-                    #     # xd, yd = x, x*0.+sh[0]//2
-                    #     #
-                    #     # for _iter in range(3):
-                    #     #     xs, ys, ls = d2s(xd, yd)
-                    #     #     xd, yd = s2d(x*0, x*0. + _slit.source_ypos, ls)
-                    #     #     yd = np.interp(x, xd, yd)
-                    #     #     xd = x
-                    #     #
-                    #     # dith = _slit.meta.dither.instance
-                    #     # if dith['position_number'] == 1:
-                    #     #     # Center world coord in slit
-                    #     #     rs, ds, _ = s2w(0, _slit.source_ypos, np.median(ls))
-                    #     #     slitlet['slit_ra'] = rs
-                    #     #     slitlet['slit_dec'] = ds
-                    #     #
-                    #     #     xref = xd*1.
-                    #     #     yref = yd*1.
-                    #     #
-                    #     #     xtr = x*1
-                    #     #     ytr = yref + yoffset + 0.5
-                    #     #
-                    #     # else:
-                    #     #
-                    #     #     ytr = yref*2 - yd + yoffset + 0.5
-                    #
-                    #     _ras, _des, ws = d2w(xtr, ytr)
-                    #
-                    #     # rs, ds, ws = _wcs.forward_transform(x,
-                    #     #                              x*0+np.nanmean(yp[_dq]))
-                    #     # if _ra is None:
-                    #     #     if (slitlet['source_ra'] > 0):
-                    #     #         _ra = slitlet['source_ra']
-                    #     #         _dec = slitlet['source_dec']
-                    #     #     else:
-                    #     #         x0 = np.nanmean(xp[_dq])
-                    #     #         y0 = np.nanmean(yp[_dq])
-                    #     #         _ra, _dec, w0 = _wcs.forward_transform(x0, y0)
-                    #     #         msg = f'msaexp.extract_spectrum: Set '
-                    #     #         msg += f' source_ra/source_dec: '
-                    #     #         msg += f'{_ra}, {_dec}'
-                    #     #         utils.log_comment(utils.LOGFILE, msg,
-                    #     #                           verbose=True)
-                    #     #
-                    #     #         slitlet['source_ra'] = _ra
-                    #     #         slitlet['source_dec'] = _dec
-                    #     #
-                    #     # xtr, ytr = _wcs.backward_transform(_ra, _dec, ws)
-                    #     # yeval = np.nanmean(ytr)
-                    #     #
-                    #     # dytest = [0]
-                    #     # for _dy in range(sh[0]):
-                    #     #     dytest.extend([-_dy, _dy])
-                    #     #
-                    #     # for dy in dytest:
-                    #     #     rs, ds, ws = _wcs.forward_transform(x,
-                    #     #                                         x*0+yeval+dy)
-                    #     #     if verbose:
-                    #     #         print('dy: ', (~np.isfinite(ws)).sum(), dy)
-                    #     #
-                    #     #     if (~np.isfinite(ws)).sum() == 0:
-                    #     #         if verbose:
-                    #     #             print('y center: ', dy)
-                    #     #         break
-                    #     #
-                    #     # xtr, ytr = _wcs.backward_transform(_ra, _dec, ws)
-                    #     # ytr -= 0.5
-                    #     # ytr += yoffset
-                    #     # xtr = x*1
-                    #     #
-                    #     # # Todo - calculate ws again with offset?
-                    #     # rx, dx, ws = _wcs.forward_transform(xtr, ytr)
-                    #
-                    # else:
-                    #     _sbg = pipe[j].slits[i]
-                    #     dy_off = (_sbg.meta.dither.y_offset -
-                    #               _slit.meta.dither.y_offset)
-                    #
-                    #     if np.abs(dy_off) < min_dyoffset:
-                    #         continue
-                    #
-                    #     _dq = (_sbg.dq & bad_dq_bits) == 0
-                    #     try:
-                    #         _bkg += _sbg.data*_dq
-                    #         _bkgn += _dq
-                    #     except ValueError:
-                    #         #print('background failed', j)
-                    #         continue
-
+                    
                 if (np.nanmax(_bkg) == 0) & (not get_slit_data):
                     axi = axes[ip]
                     axi.imshow(_sci*0., vmin=-0.05, vmax=0.3,
@@ -1147,7 +1200,7 @@ class NirspecPipeline():
                 if np.isfinite(ws).sum() == 0:
                     continue
 
-                _bkgn[_bkgn == 0] = 1
+                # _bkgn[_bkgn == 0] = 1
                 _clean = _sci - _bkg/_bkgn
                                 
                 bad = ~np.isfinite(_clean)
@@ -1162,6 +1215,8 @@ class NirspecPipeline():
                     _bkg_slit.data = _clean*1
                     _bkg_slit.dq = (bad*1).astype(_bkg_slit.dq.dtype)
                     _bkg_slit.has_background = True
+                    _bkg_slit._bkg = _bkg
+                    _bkg_slit._bkgn = _bkgn
                     
                 prof = prf(yp.flatten()*0, (yp - ytr).flatten()).reshape(sh)
                         
@@ -1447,9 +1502,13 @@ class NirspecPipeline():
                 if close:
                     plt.close('all')
 
+
     def get_slit_polygons(self, include_yoffset=False):
         """
         Get slit polygon regions using slit wcs
+        
+        **Deprecated**, use `~msaexp.msa.MSAMetafile.regions_from_metafile`.
+        
         """
         from tqdm import tqdm
         slit_key = self.last_step
@@ -1533,7 +1592,23 @@ class NirspecPipeline():
 
     def load_slit_data(self, step='phot', verbose=True, indices=None, targets=None):
         """
-        Load slit data from files
+        Load slitlet data from saved files.  This script runs `msaexp.pipeline.SlitData` for
+        each exposure file in the group.
+        
+        Parameters
+        ----------
+        step : str
+            Calibration pipeline processing step
+        
+        verbose : bool
+            Print status messages
+        
+        indices : list, None
+            Optional slit indices of specific files
+        
+        targets : list, None
+            Optional target names of specific individual sources
+        
         """
         slit_lists = [SlitData(file, step=step, read=False,
                                indices=indices, targets=targets)
@@ -1552,6 +1627,7 @@ class NirspecPipeline():
 
     def parse_slit_info(self, write=True):
         """
+        Parse information from / to ``{mode}.slits.yaml`` file
         """
         import yaml
 
@@ -1610,16 +1686,13 @@ class NirspecPipeline():
             return True
             
         else:
-            self.preprocess()
-            self.run_jwst_pipeline()
+            self.preprocess(**kwargs)
+            self.run_jwst_pipeline(**kwargs)
         
         self.slitlets = self.initialize_slit_metadata()
         
         self.get_slit_traces()
         
-        if make_regions:
-            self.slit_bounding_box_regions()
-                
         if run_extractions:
             self.extract_all_slits(**kwargs)
         
@@ -1638,6 +1711,7 @@ class NirspecPipeline():
 
 def make_summary_tables(root='msaexp', zout=None):
     """
+    Make a summary table of all extracted sources
     """
     import yaml
     import astropy.table
